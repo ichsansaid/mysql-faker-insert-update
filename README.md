@@ -1,7 +1,3 @@
-Tentu, ini draf `README.md` yang lengkap untuk proyek Anda.
-
------
-
 # Go Dynamic Data Simulator & Load Generator 🚀
 
 [](https://golang.org/dl/)
