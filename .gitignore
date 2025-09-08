@@ -1,0 +1,9 @@
+# Mysql-faker-insert-update
+/vendor
+/node_modules
+.env
+.env.testing
+/public/hot
+/storage/*.key
+/storage/framework/testing/.gnupg
+/build
