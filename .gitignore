@@ -7,3 +7,5 @@
 /storage/*.key
 /storage/framework/testing/.gnupg
 /build
+config.json
+schema.sql
