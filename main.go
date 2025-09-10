@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faker/faker/v4"
@@ -128,8 +129,9 @@ func main() {
 	}
 	log.Printf("Mode: %s | Worker threads: %d | Total operations: %d", *mode, *threadCount, *totalOps)
 
-	// Inisialisasi channels dan waitgroup
+	// Inisialisasi channels, waitgroup, dan atomic counter
 	var workerWg sync.WaitGroup
+	var opsCompletedCounter atomic.Int64 // <-- Variabel atomic untuk progres
 	jobChannel := make(chan SQLJob, *threadCount*2)
 	idTracker := &IDTracker{}
 	resultsChan := make(chan WorkerResult, *threadCount)
@@ -137,10 +139,34 @@ func main() {
 	// Menjalankan workers
 	for i := 0; i < *threadCount; i++ {
 		workerWg.Add(1)
-		go worker(i+1, &workerWg, cfg, jobChannel, resultsChan, idTracker, table)
+		// Kirim pointer ke atomic counter ke setiap worker
+		go worker(i+1, &workerWg, cfg, jobChannel, resultsChan, idTracker, table, &opsCompletedCounter)
 	}
 
 	startDate := time.Now()
+
+	// --- Goroutine untuk Progress Report ---
+	doneReporter := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				currentOps := opsCompletedCounter.Load()
+				elapsed := time.Since(startDate).Seconds()
+				var qps float64
+				if elapsed > 0 {
+					qps = float64(currentOps) / elapsed
+				}
+				percent := (float64(currentOps) / float64(*totalOps)) * 100
+
+				fmt.Printf("\rProgress: %d/%d (%.2f%%) | QPS: %.2f\n", currentOps, *totalOps, percent, qps)
+			case <-doneReporter:
+				return // Hentikan reporter
+			}
+		}
+	}()
 
 	// Membuat dan mengirim jobs ke jobChannel
 	for i := 0; i < *totalOps; i++ {
@@ -165,8 +191,11 @@ func main() {
 	// Menunggu semua worker selesai
 	workerWg.Wait()
 	close(resultsChan)
-
 	endDate := time.Now()
+
+	// Hentikan goroutine reporter dan cetak baris baru
+	doneReporter <- true
+	fmt.Println() // Pindah ke baris baru setelah progress selesai
 
 	// Agregasi hasil dari semua worker
 	var finalTotalOps int64
@@ -194,7 +223,7 @@ func main() {
 }
 
 // worker adalah goroutine yang menjalankan query SQL.
-func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, resultsChan chan<- WorkerResult, idTracker *IDTracker, table TableDef) {
+func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, resultsChan chan<- WorkerResult, idTracker *IDTracker, table TableDef, opsCounter *atomic.Int64) {
 	defer wg.Done()
 
 	// Setiap worker membuat koneksi DB sendiri
@@ -252,6 +281,7 @@ func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, 
 		} else {
 			// Update statistik lokal
 			localOpsCount++
+			opsCounter.Add(1) // <-- NAIKKAN ATOMIC COUNTER DI SINI
 			totalLatency += latency
 			if latency > maxLatency {
 				maxLatency = latency
