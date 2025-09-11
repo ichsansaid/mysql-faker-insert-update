@@ -152,35 +152,32 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		var m runtime.MemStats
-		// --- Variabel ini perlu didefinisikan di luar loop Anda ---
+
 		var beforePendingOps int64 = 0
-		var beforeCompletedOps int64 = 0 // Melacak jumlah operasi SELESAI sebelumnya
+		var beforeCompletedOps int64 = 0
 		var lastCheckTime time.Time = time.Now()
-		// ---------------------------------------------------------
+
 		for {
 			select {
 			case <-ticker.C:
 
-				// Di dalam loop ticker/progress Anda:
 				var totalCompletedOps int64 = 0
 				var pendingRequests int = 0
 				var totalLatency time.Duration = 0
 				var maxLatency time.Duration = 0
-				var oldestPendingStart time.Time // Untuk melacak waktu mulai request tertua
+				var oldestPendingStart time.Time
 
-				// 1. Logika Baru: Memisahkan request yang selesai dan yang masih pending
 				for i := range workers {
 					for j := range workers[i].Requests {
 						request := workers[i].Requests[j]
-						// Cek jika request belum selesai (EndExec adalah zero value)
 						if request.EndExec.IsZero() {
 							pendingRequests++
-							// Lacak waktu mulai request pending yang paling tua
+
 							if oldestPendingStart.IsZero() || request.StartExec.Before(oldestPendingStart) {
 								oldestPendingStart = request.StartExec
 							}
 						} else {
-							// Jika sudah selesai, hitung seperti biasa
+
 							totalCompletedOps++
 							requestLatency := request.EndExec.Sub(request.StartExec)
 							totalLatency += requestLatency
@@ -191,7 +188,6 @@ func main() {
 					}
 				}
 
-				// 2. Perhitungan Metrik yang Disesuaikan dan Metrik Baru
 				beforeCompletedOps = totalCompletedOps - beforeCompletedOps
 				beforePendingOps = int64(pendingRequests) - int64(beforePendingOps)
 				if beforePendingOps < 0 {
@@ -212,19 +208,17 @@ func main() {
 
 				var avgLatencyMs float64
 				if totalCompletedOps > 0 {
-					// Menghitung latency rata-rata dari semua request yang telah selesai
+
 					avgLatencyMs = float64(totalLatency.Milliseconds()) / float64(totalCompletedOps)
 				}
 
 				percent := (float64(totalCompletedOps) / float64(*totalOps)) * 100
 
-				// 3. Metrik Sistem
 				cpuPercentages, _ := cpu.Percent(0, false)
 				cpuUsage := cpuPercentages[0]
 				runtime.ReadMemStats(&m)
 				memAllocMB := m.Alloc / 1024 / 1024
 
-				// 4. Sprintf Diperkaya dengan Metrik Pending
 				progressMsg := fmt.Sprintf(
 					"Progress: %d/%d (%.2f%%) | Done: +%d | Total Pending: %d | Oldest: %.1fs | QPS: %.2f | Latency(avg/max): %.2fms/%.0fms | CPU: %.1f%% | Mem: %dMB",
 					totalCompletedOps,
@@ -240,7 +234,6 @@ func main() {
 					memAllocMB,
 				)
 
-				// Reset untuk iterasi berikutnya
 				beforeCompletedOps = totalCompletedOps
 				lastCheckTime = time.Now()
 				fmt.Println(progressMsg)
