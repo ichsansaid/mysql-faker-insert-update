@@ -107,6 +107,7 @@ Jalankan aplikasi dari terminal dengan menyediakan flag yang diperlukan.
 | `-ddl` | **Wajib.** Path menuju file skema tabel `.sql`. | `""` |
 | `-mode` | Mode operasi. Pilihan: `insert` atau `mixed`. | `insert` |
 | `-update-ratio` | Rasio operasi `UPDATE` dalam mode `mixed` (misal: 0.3 untuk 30%). | `0.3` |
+| `-batch-insert` | Berapa data batch yang akan di insert per `INSERT` | `1` |
 
 ### Contoh
 
