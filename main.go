@@ -10,17 +10,17 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-faker/faker/v4"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
-// DBConfig mendefinisikan konfigurasi koneksi database.
 type DBConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -29,7 +29,6 @@ type DBConfig struct {
 	DBName   string `json:"dbname"`
 }
 
-// ColumnDef menyimpan metadata tentang kolom tabel.
 type ColumnDef struct {
 	Name      string
 	Type      string
@@ -37,34 +36,30 @@ type ColumnDef struct {
 	FakerRule string
 }
 
-// TableDef menyimpan definisi tabel yang akan diisi data.
 type TableDef struct {
 	Name     string
 	Columns  []ColumnDef
 	PKColumn string
 }
 
-// SQLJob merepresentasikan satu pekerjaan (INSERT/UPDATE) yang harus dilakukan worker.
 type SQLJob struct {
 	Operation string
 	Data      []interface{}
 	TargetID  int64
+	RowCount  int
 }
 
-// IDTracker melacak ID primary key yang sudah di-insert untuk operasi UPDATE.
 type IDTracker struct {
 	mu  sync.Mutex
 	ids []int64
 }
 
-// Add menambahkan ID baru ke tracker secara thread-safe.
 func (t *IDTracker) Add(id int64) {
 	t.mu.Lock()
 	t.ids = append(t.ids, id)
 	t.mu.Unlock()
 }
 
-// GetRandomID mengambil ID acak dari tracker secara thread-safe.
 func (t *IDTracker) GetRandomID() (int64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -75,13 +70,18 @@ func (t *IDTracker) GetRandomID() (int64, bool) {
 	return t.ids[randomIndex], true
 }
 
-// WorkerResult digunakan untuk melaporkan hasil dari setiap worker setelah selesai.
+type RequestResult struct {
+	StartExec time.Time
+	EndExec   time.Time
+}
+
 type WorkerResult struct {
 	WorkerID     int
 	OpsCompleted int64
 	TotalLatency time.Duration
 	MaxLatency   time.Duration
 	MinLatency   time.Duration
+	Requests     []RequestResult
 }
 
 const (
@@ -90,13 +90,14 @@ const (
 )
 
 func main() {
-	// Parsing command-line arguments
+
 	threadCount := flag.Int("threads", 10, "Number of GoRoutines to spawn")
-	totalOps := flag.Int("ops", 10000, "Total number of operations to perform")
+	totalOps := flag.Int("ops", 10000, "Total number of operations (rows) to perform")
 	ddlPath := flag.String("ddl", "", "Path to the DDL (.sql) file")
 	configPath := flag.String("config", "", "Path to the database config (.json) file")
 	mode := flag.String("mode", "insert", "Operation mode: 'insert' or 'mixed'")
 	updateRatio := flag.Float64("update-ratio", 0.3, "Ratio of UPDATEs in 'mixed' mode (e.g., 0.3 for 30%)")
+	batchInsertSize := flag.Int("batch-insert", 1, "Number of rows to insert in a single batch statement")
 	flag.Parse()
 
 	if *ddlPath == "" || *configPath == "" {
@@ -106,6 +107,10 @@ func main() {
 	}
 	if *mode != "insert" && *mode != "mixed" {
 		log.Fatalf("Error: Invalid mode '%s'. Alowed modes are 'insert' or 'mixed'.", *mode)
+	}
+	if *batchInsertSize < 1 {
+		log.Println("Warning: batch-insert size must be at least 1. Defaulting to 1.")
+		*batchInsertSize = 1
 	}
 
 	log.Println("Starting data simulator...")
@@ -127,77 +132,169 @@ func main() {
 			log.Println("Mode has been forced to 'insert'.")
 		}
 	}
-	log.Printf("Mode: %s | Worker threads: %d | Total operations: %d", *mode, *threadCount, *totalOps)
+	log.Printf("Mode: %s | Worker threads: %d | Total operations: %d | Batch Insert Size: %d", *mode, *threadCount, *totalOps, *batchInsertSize)
 
-	// Inisialisasi channels, waitgroup, dan atomic counter
 	var workerWg sync.WaitGroup
-	var opsCompletedCounter atomic.Int64 // <-- Variabel atomic untuk progres
 	jobChannel := make(chan SQLJob, *threadCount*2)
 	idTracker := &IDTracker{}
-	resultsChan := make(chan WorkerResult, *threadCount)
+	resultsChan := make(chan *WorkerResult, *threadCount)
+	workers := make([]WorkerResult, *threadCount)
 
-	// Menjalankan workers
 	for i := 0; i < *threadCount; i++ {
 		workerWg.Add(1)
-		// Kirim pointer ke atomic counter ke setiap worker
-		go worker(i+1, &workerWg, cfg, jobChannel, resultsChan, idTracker, table, &opsCompletedCounter)
+		go worker(i+1, &workers[i], &workerWg, cfg, jobChannel, resultsChan, idTracker, table)
 	}
 
 	startDate := time.Now()
 
-	// --- Goroutine untuk Progress Report ---
 	doneReporter := make(chan bool)
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		var m runtime.MemStats
+		// --- Variabel ini perlu didefinisikan di luar loop Anda ---
+		var beforePendingOps int64 = 0
+		var beforeCompletedOps int64 = 0 // Melacak jumlah operasi SELESAI sebelumnya
+		var lastCheckTime time.Time = time.Now()
+		// ---------------------------------------------------------
 		for {
 			select {
 			case <-ticker.C:
-				currentOps := opsCompletedCounter.Load()
-				elapsed := time.Since(startDate).Seconds()
-				var qps float64
-				if elapsed > 0 {
-					qps = float64(currentOps) / elapsed
-				}
-				percent := (float64(currentOps) / float64(*totalOps)) * 100
 
-				fmt.Printf("\rProgress: %d/%d (%.2f%%) | QPS: %.2f\n", currentOps, *totalOps, percent, qps)
+				// Di dalam loop ticker/progress Anda:
+				var totalCompletedOps int64 = 0
+				var pendingRequests int = 0
+				var totalLatency time.Duration = 0
+				var maxLatency time.Duration = 0
+				var oldestPendingStart time.Time // Untuk melacak waktu mulai request tertua
+
+				// 1. Logika Baru: Memisahkan request yang selesai dan yang masih pending
+				for i := range workers {
+					for j := range workers[i].Requests {
+						request := workers[i].Requests[j]
+						// Cek jika request belum selesai (EndExec adalah zero value)
+						if request.EndExec.IsZero() {
+							pendingRequests++
+							// Lacak waktu mulai request pending yang paling tua
+							if oldestPendingStart.IsZero() || request.StartExec.Before(oldestPendingStart) {
+								oldestPendingStart = request.StartExec
+							}
+						} else {
+							// Jika sudah selesai, hitung seperti biasa
+							totalCompletedOps++
+							requestLatency := request.EndExec.Sub(request.StartExec)
+							totalLatency += requestLatency
+							if requestLatency > maxLatency {
+								maxLatency = requestLatency
+							}
+						}
+					}
+				}
+
+				// 2. Perhitungan Metrik yang Disesuaikan dan Metrik Baru
+				beforeCompletedOps = totalCompletedOps - beforeCompletedOps
+				beforePendingOps = int64(pendingRequests) - int64(beforePendingOps)
+				if beforePendingOps < 0 {
+					beforePendingOps = 0
+				}
+
+				secondsSinceLastCheck := time.Since(lastCheckTime).Seconds()
+
+				var ageOfOldestPending float64
+				if !oldestPendingStart.IsZero() {
+					ageOfOldestPending = time.Since(oldestPendingStart).Seconds()
+				}
+
+				var qpsInstan float64
+				if secondsSinceLastCheck > 0 {
+					qpsInstan = float64(beforeCompletedOps) / secondsSinceLastCheck
+				}
+
+				var avgLatencyMs float64
+				if totalCompletedOps > 0 {
+					// Menghitung latency rata-rata dari semua request yang telah selesai
+					avgLatencyMs = float64(totalLatency.Milliseconds()) / float64(totalCompletedOps)
+				}
+
+				percent := (float64(totalCompletedOps) / float64(*totalOps)) * 100
+
+				// 3. Metrik Sistem
+				cpuPercentages, _ := cpu.Percent(0, false)
+				cpuUsage := cpuPercentages[0]
+				runtime.ReadMemStats(&m)
+				memAllocMB := m.Alloc / 1024 / 1024
+
+				// 4. Sprintf Diperkaya dengan Metrik Pending
+				progressMsg := fmt.Sprintf(
+					"Progress: %d/%d (%.2f%%) | Done: +%d | Total Pending: %d | Oldest: %.1fs | QPS: %.2f | Latency(avg/max): %.2fms/%.0fms | CPU: %.1f%% | Mem: %dMB",
+					totalCompletedOps,
+					*totalOps,
+					percent,
+					beforeCompletedOps,
+					pendingRequests,
+					ageOfOldestPending,
+					qpsInstan,
+					avgLatencyMs,
+					float64(maxLatency.Milliseconds()),
+					cpuUsage,
+					memAllocMB,
+				)
+
+				// Reset untuk iterasi berikutnya
+				beforeCompletedOps = totalCompletedOps
+				lastCheckTime = time.Now()
+				fmt.Println(progressMsg)
+
 			case <-doneReporter:
-				return // Hentikan reporter
+				return
 			}
 		}
 	}()
 
-	// Membuat dan mengirim jobs ke jobChannel
-	for i := 0; i < *totalOps; i++ {
-		var job SQLJob
-		shouldUpdate := (table.PKColumn != "" && *mode == "mixed" && rand.Float64() < *updateRatio)
-		if shouldUpdate {
-			if targetID, ok := idTracker.GetRandomID(); ok {
-				record, _ := generateFakeData(table)
-				job = SQLJob{Operation: OpUpdate, Data: record, TargetID: targetID}
-			} else {
-				shouldUpdate = false
+	go func() {
+		defer close(jobChannel)
+		var insertBatchData []interface{}
+		var batchRowCount int = 0
+		flushBatch := func() {
+			if batchRowCount > 0 {
+				job := SQLJob{Operation: OpInsert, Data: insertBatchData, RowCount: batchRowCount}
+				jobChannel <- job
+				insertBatchData = nil
+				batchRowCount = 0
 			}
 		}
-		if !shouldUpdate {
-			record, _ := generateFakeData(table)
-			job = SQLJob{Operation: OpInsert, Data: record}
+		for i := 0; i < *totalOps; i++ {
+			var job SQLJob
+			isUpdateOp := (table.PKColumn != "" && *mode == "mixed" && rand.Float64() < *updateRatio)
+			if isUpdateOp {
+				flushBatch()
+				if targetID, ok := idTracker.GetRandomID(); ok {
+					record, _ := generateFakeData(table)
+					job = SQLJob{Operation: OpUpdate, Data: record, TargetID: targetID, RowCount: 1}
+					jobChannel <- job
+				} else {
+					isUpdateOp = false
+				}
+			}
+			if !isUpdateOp {
+				record, _ := generateFakeData(table)
+				insertBatchData = append(insertBatchData, record...)
+				batchRowCount++
+				if batchRowCount == *batchInsertSize {
+					flushBatch()
+				}
+			}
 		}
-		jobChannel <- job
-	}
-	close(jobChannel)
+		flushBatch()
+	}()
 
-	// Menunggu semua worker selesai
 	workerWg.Wait()
 	close(resultsChan)
 	endDate := time.Now()
 
-	// Hentikan goroutine reporter dan cetak baris baru
 	doneReporter <- true
-	fmt.Println() // Pindah ke baris baru setelah progress selesai
+	fmt.Println()
 
-	// Agregasi hasil dari semua worker
 	var finalTotalOps int64
 	var maxLatency time.Duration = 0
 
@@ -209,38 +306,27 @@ func main() {
 		}
 	}
 
-	// Laporan Akhir
 	elapsedTime := endDate.Sub(startDate)
 	log.Println("--- Final Report ---")
 	log.Printf("A total of %d operations were completed.", finalTotalOps)
 	log.Printf("Total time taken: %s", elapsedTime)
 	if finalTotalOps > 0 {
 		log.Printf("Average QPS (Queries Per Second): %.2f", float64(finalTotalOps)/elapsedTime.Seconds())
-		log.Printf("Average time per operation: %s", elapsedTime/time.Duration(finalTotalOps))
+		log.Printf("Average time per operation: %.2fms", float64(elapsedTime.Milliseconds())/float64(finalTotalOps))
 	}
 	log.Printf("Max Latency observed across all workers: %s", maxLatency)
 	log.Println("All workers finished. Process complete.")
 }
 
-// worker adalah goroutine yang menjalankan query SQL.
-func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, resultsChan chan<- WorkerResult, idTracker *IDTracker, table TableDef, opsCounter *atomic.Int64) {
+func worker(id int, worker *WorkerResult, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, resultsChan chan<- *WorkerResult, idTracker *IDTracker, table TableDef) {
 	defer wg.Done()
 
-	// Setiap worker membuat koneksi DB sendiri
 	db, err := connectDB(cfg)
 	if err != nil {
 		log.Printf("Worker %d | Failed to connect to database: %v", id, err)
 		return
 	}
 	defer db.Close()
-
-	// Menyiapkan prepared statements
-	insertStmt, err := db.Prepare(buildInsertStatement(table))
-	if err != nil {
-		log.Printf("Worker %d | Failed to prepare insert statement: %v", id, err)
-		return
-	}
-	defer insertStmt.Close()
 
 	var updateStmt *sql.Stmt
 	if table.PKColumn != "" {
@@ -252,36 +338,42 @@ func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, 
 		defer updateStmt.Close()
 	}
 
-	// Variabel lokal untuk melacak progress worker ini saja
 	var localOpsCount int64 = 0
 	var totalLatency time.Duration = 0
 	var maxLatency time.Duration = 0
 	var minLatency time.Duration = -1
 
 	for job := range jobChannel {
-		var res sql.Result
 		var execErr error
 
-		start := time.Now()
+		var latency time.Duration
 		switch job.Operation {
 		case OpInsert:
-			res, execErr = insertStmt.Exec(job.Data...)
+			var res sql.Result
+			insertSQL := buildInsertStatement(table, job.RowCount)
+			start := time.Now()
+			worker.Requests = append(worker.Requests, RequestResult{StartExec: start})
+			res, execErr = db.Exec(insertSQL, job.Data...)
+			timeEnd := time.Now()
+			latency = timeEnd.Sub(start)
 			if execErr == nil && table.PKColumn != "" {
 				newID, _ := res.LastInsertId()
 				idTracker.Add(newID)
+			} else if execErr != nil {
+				log.Printf("Worker %d | Error: %v", id, execErr)
 			}
+			worker.Requests[len(worker.Requests)-1].EndExec = timeEnd
 		case OpUpdate:
+			start := time.Now()
 			args := append(job.Data, job.TargetID)
 			_, execErr = updateStmt.Exec(args...)
-		}
-		latency := time.Since(start)
+			latency = time.Since(start)
 
+		}
 		if execErr != nil {
 			log.Printf("Worker %d | Error: %v", id, execErr)
 		} else {
-			// Update statistik lokal
-			localOpsCount++
-			opsCounter.Add(1) // <-- NAIKKAN ATOMIC COUNTER DI SINI
+			localOpsCount += int64(job.RowCount)
 			totalLatency += latency
 			if latency > maxLatency {
 				maxLatency = latency
@@ -291,18 +383,15 @@ func worker(id int, wg *sync.WaitGroup, cfg DBConfig, jobChannel <-chan SQLJob, 
 			}
 		}
 	}
+	worker.WorkerID = id
+	worker.OpsCompleted = localOpsCount
+	worker.TotalLatency = totalLatency
+	worker.MaxLatency = maxLatency
+	worker.MinLatency = minLatency
 
-	// Kirim hasil akhir ke main goroutine melalui channel
-	resultsChan <- WorkerResult{
-		WorkerID:     id,
-		OpsCompleted: localOpsCount,
-		TotalLatency: totalLatency,
-		MaxLatency:   maxLatency,
-		MinLatency:   minLatency,
-	}
+	resultsChan <- worker
 }
 
-// parseDDLFile membaca dan mem-parsing file DDL.
 func parseDDLFile(path string) (TableDef, error) {
 	content, err := ioutil.ReadFile(path)
 	if err != nil {
@@ -311,7 +400,6 @@ func parseDDLFile(path string) (TableDef, error) {
 	return parseDDL(string(content))
 }
 
-// parseDDL mengekstrak nama tabel, kolom, tipe data, dan aturan faker dari string DDL.
 func parseDDL(ddl string) (TableDef, error) {
 	var table TableDef
 	tableNameRegex := regexp.MustCompile("(?i)CREATE TABLE `?(\\w+)`?")
@@ -372,21 +460,27 @@ func parseDDL(ddl string) (TableDef, error) {
 	return table, nil
 }
 
-// buildInsertStatement membuat query INSERT INTO ... VALUES (...)
-func buildInsertStatement(table TableDef) string {
-	var columnNames, valuePlaceholders []string
+func buildInsertStatement(table TableDef, batchSize int) string {
+	var columnNames []string
+	var valuePlaceholders []string
+
 	for _, col := range table.Columns {
 		if col.Name == table.PKColumn {
 			continue
 		}
 		columnNames = append(columnNames, fmt.Sprintf("`%s`", col.Name))
-		valuePlaceholders = append(valuePlaceholders, "?")
 	}
-	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+
+	singleRowPlaceholder := fmt.Sprintf("(%s)", strings.Join(strings.Split(strings.Repeat("?", len(columnNames)), ""), ", "))
+
+	for i := 0; i < batchSize; i++ {
+		valuePlaceholders = append(valuePlaceholders, singleRowPlaceholder)
+	}
+
+	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
 		table.Name, strings.Join(columnNames, ", "), strings.Join(valuePlaceholders, ", "))
 }
 
-// buildUpdateStatement membuat query UPDATE ... SET ... WHERE ...
 func buildUpdateStatement(table TableDef) string {
 	var setClauses []string
 	for _, col := range table.Columns {
@@ -399,7 +493,6 @@ func buildUpdateStatement(table TableDef) string {
 		table.Name, strings.Join(setClauses, ", "), table.PKColumn)
 }
 
-// loadConfig memuat konfigurasi DB dari file JSON.
 func loadConfig(path string) (DBConfig, error) {
 	var config DBConfig
 	file, err := os.Open(path)
@@ -412,7 +505,6 @@ func loadConfig(path string) (DBConfig, error) {
 	return config, err
 }
 
-// connectDB membuka koneksi ke database dan melakukan ping.
 func connectDB(cfg DBConfig) (*sql.DB, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
 		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.DBName)
@@ -429,7 +521,6 @@ func connectDB(cfg DBConfig) (*sql.DB, error) {
 	return db, nil
 }
 
-// generateFakeData membuat satu baris data palsu sesuai definisi tabel.
 func generateFakeData(table TableDef) ([]interface{}, error) {
 	values := make([]interface{}, 0, len(table.Columns))
 	for _, col := range table.Columns {
@@ -439,7 +530,6 @@ func generateFakeData(table TableDef) ([]interface{}, error) {
 		var val interface{}
 		ruleProcessed := false
 		if col.FakerRule != "" {
-			// Parsing untuk aturan INT[min:max]
 			if strings.HasPrefix(col.FakerRule, "INT[") {
 				re := regexp.MustCompile(`INT\[(\d+):(\d+)\]`)
 				matches := re.FindStringSubmatch(col.FakerRule)
